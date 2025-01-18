@@ -25,6 +25,34 @@ def get_stats(ids, counts=None):
         counts[pair] = counts.get(pair, 0) + 1
     return counts
 
+import numpy as np
+
+def get_stats_with_numpy(ids: np.ndarray, exclude_values:np.ndarray):
+    # Compute pairs
+    # We are using numpy and bit operations to speed up calculation of pair counts. numpy array achieves parallelization through vector operations
+
+    #The code effectively pairs consecutive elements of ids into single integers, 
+    # with the earlier element occupying the higher 32 bits and the subsequent element the lower 32 bits of each 64-bit integer. 
+    # This technique could be useful for creating unique identifiers from pairs of numbers, ensuring that the pair (a, b) is distinct 
+    # from (b, a) if a and b are different.
+    pairs = ids[:-1] * (1 << 32) + ids[1:]  # Pack consecutive pairs into a single integer
+    
+    # Mask to exclude pairs where either element is a space or punctuation mark represented by array exclude_values
+    mask = ~np.isin(ids[:-1], exclude_values) & ~np.isin(ids[1:], exclude_values)
+    # filtered_pairs now excludes pairs where at least one component is in exclude_values
+    # we want to ignore pairs where one component is a space or punctuation mark. we don't want to treat combination of character and punctuation mark as a token
+    # instead punctuation mark is treated as a separate token
+    filtered_pairs = pairs[mask]  # Apply the mask to pairs
+
+    # Count unique pairs
+    unique, pair_counts = np.unique(filtered_pairs, return_counts=True)
+    # p>>32 extracts first number from 64 bit integer, p & (1<<32-1) extracts second number from 64 bit integer
+    # our filtered_pairs array combines pair like (356, 1230) into a single 64 bit integer like 345678987234555 (not accurate)
+    # then from that big 64 bit integer like 345678987234555 we extract (356, 1230)
+    pair_dict = {(p >> 32, p & ((1 << 32) - 1)): count for p, count in zip(unique, pair_counts)}
+
+    return pair_dict
+
 
 def merge(ids: List[int], pair: Tuple[int, int], idx: int):
     """
@@ -76,6 +104,37 @@ def merge_gpu(ids: torch.Tensor, pair: Tuple[int, int], idx: int) -> torch.Tenso
         j += 1
 
     return result[:j]  # Truncate the result tensor to its final size
+
+def merge_gpu_vectorized(ids: torch.Tensor, pair: Tuple[int, int], idx: int) -> torch.Tensor:
+    """
+    Fully vectorized GPU implementation to replace all consecutive occurrences
+    of `pair` in `ids` with `idx`.
+
+    Args:
+        ids (torch.Tensor): 1D tensor of integers representing the list.
+        pair (Tuple[int, int]): The pair of integers to replace.
+        idx (int): The new token ID to insert.
+
+    Returns:
+        torch.Tensor: 1D tensor with the replaced tokens.
+    """
+    # Identify where the pair starts
+    match_starts = (ids[:-1] == pair[0]) & (ids[1:] == pair[1])
+
+    # Create an output tensor for indices
+    keep = torch.ones(ids.size(0), dtype=torch.bool, device=ids.device)
+
+    # ~ inverts boolean values. keep[1:] will represent second element of each pair.
+    # match_starts has True where first element of pair is detected. By inverting that 
+    # and doing AND operation against second elements we set indices wher second element of pair occurs to False
+    keep[1:] &= ~match_starts  # Remove the second element of each pair
+
+    # Assign replacement indices. nonzero() returns a 2D tensor by default. each row has indices along dimensions where input_tensor is non-zero.
+    # as_tuple will return all those rows as elements of tuple. that way we can extract 1D tensor with locations where pair starts in the original ids list
+    ids[match_starts.nonzero(as_tuple=True)[0]] = idx
+
+    # Filter the output to keep non-removed elements
+    return ids[keep]
 
 
 # first two helper functions...
